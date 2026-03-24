@@ -482,6 +482,14 @@ func (s *composeService) waitDependencies(ctx context.Context, project *types.Pr
 				case ServiceConditionRunningOrHealthy:
 					isHealthy, err := s.isServiceHealthy(ctx, waitingFor, true)
 					if err != nil {
+						// A container that exited with code 0 can be treated as
+						// successfully completed (init/oneshot containers) when the
+						// service won't be restarted by Docker after a clean exit.
+						var exitErr *containerExitError
+						if errors.As(err, &exitErr) && exitErr.exitCode == 0 && !restartsOnExit0(project, dep) {
+							s.events.On(containerEvents(waitingFor, exited)...)
+							return nil
+						}
 						if !config.Required {
 							s.events.On(containerReasonEvents(waitingFor, skippedEvent,
 								fmt.Sprintf("optional dependency %q is not running or is unhealthy", dep))...)
@@ -550,6 +558,29 @@ func (s *composeService) waitDependencies(ctx context.Context, project *types.Pr
 		return fmt.Errorf("timeout waiting for dependencies")
 	}
 	return err
+}
+
+// restartsOnExit0 reports whether Docker will restart the named service after
+// it exits with code 0. Only restart policies "always" and "unless-stopped"
+// cause a restart on clean exit; "no", "on-failure", and unset do not.
+// For deploy.restart_policy.condition, "any" (and the non-spec but accepted
+// "always" and "unless-stopped") cause a restart on clean exit.
+func restartsOnExit0(project *types.Project, serviceName string) bool {
+	service, err := project.GetService(serviceName)
+	if err != nil {
+		return false
+	}
+	switch service.Restart {
+	case types.RestartPolicyAlways, types.RestartPolicyUnlessStopped:
+		return true
+	}
+	if service.Deploy != nil && service.Deploy.RestartPolicy != nil {
+		switch service.Deploy.RestartPolicy.Condition {
+		case "any", "always", "unless-stopped":
+			return true
+		}
+	}
+	return false
 }
 
 func shouldWaitForDependency(serviceName string, dependencyConfig types.ServiceDependency, project *types.Project) (bool, error) {
@@ -803,6 +834,18 @@ func (s *composeService) getLinks(ctx context.Context, projectName string, servi
 	return links, nil
 }
 
+// containerExitError is returned by isServiceHealthy when a container has exited.
+// It carries the exit code so callers can distinguish clean exits (code 0)
+// from failures without parsing error strings.
+type containerExitError struct {
+	name     string
+	exitCode int
+}
+
+func (e *containerExitError) Error() string {
+	return fmt.Sprintf("container %s exited (%d)", e.name, e.exitCode)
+}
+
 func (s *composeService) isServiceHealthy(ctx context.Context, containers Containers, fallbackRunning bool) (bool, error) {
 	for _, c := range containers {
 		res, err := s.apiClient().ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
@@ -813,7 +856,7 @@ func (s *composeService) isServiceHealthy(ctx context.Context, containers Contai
 		name := ctr.Name[1:]
 
 		if ctr.State.Status == container.StateExited {
-			return false, fmt.Errorf("container %s exited (%d)", name, ctr.State.ExitCode)
+			return false, &containerExitError{name: name, exitCode: ctr.State.ExitCode}
 		}
 
 		noHealthcheck := ctr.Config.Healthcheck == nil || (len(ctr.Config.Healthcheck.Test) > 0 && ctr.Config.Healthcheck.Test[0] == "NONE")

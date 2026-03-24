@@ -18,6 +18,7 @@ package compose
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -366,6 +367,34 @@ func TestIsServiceHealthy(t *testing.T) {
 
 		_, err := tested.(*composeService).isServiceHealthy(ctx, containers, true)
 		assert.ErrorContains(t, err, "exited")
+		var exitErr *containerExitError
+		assert.Assert(t, errors.As(err, &exitErr))
+		assert.Equal(t, exitErr.exitCode, 1)
+	})
+
+	t.Run("exited container with exit code 0 returns containerExitError", func(t *testing.T) {
+		containerID := "test-container-id"
+		containers := Containers{
+			{ID: containerID},
+		}
+
+		apiClient.EXPECT().ContainerInspect(ctx, containerID, gomock.Any()).Return(client.ContainerInspectResult{
+			Container: container.InspectResponse{
+				ID:   containerID,
+				Name: "test-container",
+				State: &container.State{
+					Status:   "exited",
+					ExitCode: 0,
+				},
+				Config: &container.Config{},
+			},
+		}, nil)
+
+		_, err := tested.(*composeService).isServiceHealthy(ctx, containers, true)
+		assert.Assert(t, err != nil, "expected error for exited container")
+		var exitErr *containerExitError
+		assert.Assert(t, errors.As(err, &exitErr))
+		assert.Equal(t, exitErr.exitCode, 0)
 	})
 
 	t.Run("healthy container with healthcheck", func(t *testing.T) {
